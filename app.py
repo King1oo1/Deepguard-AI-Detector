@@ -852,7 +852,7 @@ custom_css = """
 
 with gr.Blocks(css=custom_css, title="DeepGuard - AI Media Forensics") as demo:
 
-    # Header with badge 
+    # Header with badge (removed version badge)
     gr.HTML("""
     <div class="main-header">
         <div>
@@ -967,7 +967,9 @@ with gr.Blocks(css=custom_css, title="DeepGuard - AI Media Forensics") as demo:
     gr.HTML("""
     <div class="footer">
         <span><i class="fas fa-copyright"></i> 2026 DeepGuard · Forensic Suite</span>
+        <span><i class="fas fa-code-branch"></i> v1.0.0</span>
         <span><i class="fas fa-flask"></i> Research Use Only</span>
+        <span><a href="#" target="_blank"><i class="fab fa-github"></i> GitHub</a></span>
     </div>
     """)
 
@@ -988,9 +990,10 @@ with gr.Blocks(css=custom_css, title="DeepGuard - AI Media Forensics") as demo:
     )
 
 # ============================================================
-# Launch 
+# Launch for Render (and Hugging Face)
 # ============================================================
 if __name__ == "__main__":
     import os
+    # Use the PORT variable from Render (default 7860 for local testing)
     port = int(os.environ.get("PORT", 7860))
     demo.launch(server_name="0.0.0.0", server_port=port)
