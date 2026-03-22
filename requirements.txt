@@ -12,3 +12,7 @@ timm
 einops
 ftfy
 pandas
+mediapipe
+easyocr
+scikit-image
+scikit-learn

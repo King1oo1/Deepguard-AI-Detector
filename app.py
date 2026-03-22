@@ -1,5 +1,6 @@
 # ============================================================
 # DEEPGUARD: AI FAKE IMAGE & VIDEO DETECTOR
+# Advanced Version with Video Fix & Weighted Average Fix
 # ============================================================
 
 import torch
@@ -12,7 +13,7 @@ from facenet_pytorch import MTCNN
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 import gradio as gr
 import librosa
 import warnings
@@ -23,33 +24,52 @@ import tempfile
 import os
 import pandas as pd
 from datetime import datetime
+from skimage.feature import local_binary_pattern
+from skimage import exposure
+import easyocr
+import mediapipe as mp
 
 warnings.filterwarnings('ignore')
 
 # ============================================================
-# Initialize Models
+# Initialize Models (Lazy loading for ViT)
 # ============================================================
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"🖥️ Using device: {device}")
 
-# CLIP Model for semantic analysis
+# CLIP Model
 print("🔍 Loading CLIP model...")
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
-# MTCNN for face detection
+# MTCNN
 print("😊 Loading face detector...")
 mtcnn = MTCNN(keep_all=True, device=device)
 
-# EfficientNet for artifact detection
+# EfficientNet (artifact detector)
 print("🧠 Loading artifact detector...")
 artifact_model = models.efficientnet_b0(pretrained=True)
 artifact_model.classifier[1] = nn.Linear(artifact_model.classifier[1].in_features, 2)
 artifact_model = artifact_model.to(device)
 artifact_model.eval()
 
-print("✅ All models loaded!")
+# Lazy loaded ViT (loaded only if selected)
+vit_model = None
+vit_processor = None
+
+def load_vit():
+    global vit_model, vit_processor
+    if vit_model is None:
+        print("🔄 Loading Vision Transformer (ViT)...")
+        from transformers import ViTForImageClassification, ViTFeatureExtractor
+        vit_model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224")
+        vit_processor = ViTFeatureExtractor.from_pretrained("google/vit-base-patch16-224")
+        vit_model.eval()
+        vit_model = vit_model.to(device)
+        print("✅ ViT loaded.")
+
+print("✅ All base models loaded!")
 
 # ============================================================
 # Core Detection Functions
@@ -267,17 +287,193 @@ detector = DeepfakeDetector()
 print("✅ Detector initialized!")
 
 # ============================================================
+# Advanced Detection Functions
+# ============================================================
+
+def hand_analysis(image):
+    """Count fingers and detect hand anomalies using MediaPipe"""
+    try:
+        mp_hands = mp.solutions.hands
+        hands = mp_hands.Hands(static_image_mode=True, max_num_hands=2, min_detection_confidence=0.5)
+        img_array = np.array(image)
+        rgb = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+        results = hands.process(rgb)
+        if not results.multi_hand_landmarks:
+            return {'score': 50, 'confidence': 30, 'details': 'No hands detected', 'fingers_count': 0}
+        finger_counts = []
+        for hand_landmarks in results.multi_hand_landmarks:
+            tips = [4, 8, 12, 16, 20]
+            count = 0
+            for tip in tips:
+                if tip != 4:
+                    base = tip - 2
+                    if hand_landmarks.landmark[tip].y < hand_landmarks.landmark[base].y:
+                        count += 1
+                else:
+                    base_thumb = hand_landmarks.landmark[2]
+                    if hand_landmarks.landmark[tip].x > base_thumb.x:
+                        count += 1
+            finger_counts.append(count)
+        is_abnormal = any(c != 5 for c in finger_counts)
+        score = 75 if is_abnormal else 25
+        confidence = 70 if is_abnormal else 50
+        return {
+            'score': score,
+            'confidence': confidence,
+            'fingers_count': finger_counts,
+            'details': f'Detected {len(finger_counts)} hand(s), finger counts: {finger_counts}'
+        }
+    except Exception as e:
+        return {'score': 50, 'confidence': 0, 'error': str(e)}
+
+def watermark_analysis(image):
+    """Detect watermarks or signs of removal using OCR and frequency analysis"""
+    try:
+        reader = easyocr.Reader(['en'], gpu=False)
+        img_array = np.array(image)
+        result = reader.readtext(img_array)
+        text_found = len(result) > 0
+        text_details = [item[1] for item in result]
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        f = np.fft.fft2(gray)
+        fshift = np.fft.fftshift(f)
+        magnitude = np.log(np.abs(fshift) + 1)
+        blur_score = np.std(magnitude) / np.mean(magnitude)
+        removal_score = 1.0 if blur_score > 3.0 else 0.0
+        h, w = gray.shape
+        corners = [gray[:h//4, :w//4], gray[:h//4, 3*w//4:],
+                   gray[3*h//4:, :w//4], gray[3*h//4:, 3*w//4:]]
+        corner_edges = [np.mean(cv2.Canny(c, 50, 150)) for c in corners]
+        high_edge_corner = any(e > 10 for e in corner_edges)
+        is_watermark = text_found or (high_edge_corner and removal_score > 0.5)
+        score = 70 if is_watermark else 30
+        confidence = 70 if text_found else 50
+        return {
+            'score': score,
+            'confidence': confidence,
+            'text_detected': text_details,
+            'removal_artifacts': removal_score > 0.5,
+            'details': f'Text found: {text_details if text_found else "None"}'
+        }
+    except Exception as e:
+        return {'score': 50, 'confidence': 0, 'error': str(e)}
+
+def texture_analysis(image):
+    """Analyze face texture using LBP histograms"""
+    try:
+        img_array = np.array(image)
+        faces, _ = mtcnn.detect(img_array)
+        if faces is None:
+            return {'score': 50, 'confidence': 30, 'details': 'No face detected'}
+        x1, y1, x2, y2 = map(int, faces[0])
+        face = img_array[y1:y2, x1:x2]
+        if face.size == 0:
+            return {'score': 50, 'confidence': 30, 'details': 'Invalid face region'}
+        gray_face = cv2.cvtColor(face, cv2.COLOR_RGB2GRAY)
+        radius = 3
+        n_points = 8 * radius
+        lbp = local_binary_pattern(gray_face, n_points, radius, method='uniform')
+        hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, n_points + 3), range=(0, n_points + 2))
+        hist = hist.astype("float")
+        hist /= (hist.sum() + 1e-6)
+        entropy = -np.sum(hist * np.log2(hist + 1e-7))
+        score = min(100, max(0, (entropy - 4.0) * 20))
+        return {
+            'score': score,
+            'confidence': 60,
+            'entropy': round(entropy, 2),
+            'details': f'Texture entropy: {entropy:.2f}'
+        }
+    except Exception as e:
+        return {'score': 50, 'confidence': 0, 'error': str(e)}
+
+def vit_analysis(image):
+    """Extract features from Vision Transformer (ViT) and classify"""
+    try:
+        load_vit()
+        inputs = vit_processor(images=image, return_tensors="pt").to(device)
+        with torch.no_grad():
+            outputs = vit_model(**inputs)
+            logits = outputs.logits
+            probs = torch.softmax(logits, dim=1)
+        entropy = -torch.sum(probs * torch.log(probs + 1e-7)).item()
+        score = min(100, max(0, (entropy - 0.5) * 100))
+        return {
+            'score': score,
+            'confidence': 70,
+            'entropy': round(entropy, 3),
+            'details': f'ViT feature entropy: {entropy:.3f}'
+        }
+    except Exception as e:
+        return {'score': 50, 'confidence': 0, 'error': str(e)}
+
+def metadata_analysis(image):
+    """Analyze image metadata and compression artifacts"""
+    try:
+        exif = image.info.get('exif')
+        has_exif = exif is not None
+        score = 60 if not has_exif else 30
+        confidence = 50
+        return {
+            'score': score,
+            'confidence': confidence,
+            'has_exif': has_exif,
+            'details': f'EXIF metadata present: {has_exif}'
+        }
+    except Exception as e:
+        return {'score': 50, 'confidence': 0, 'error': str(e)}
+
+def optical_flow_analysis(video_path):
+    """Compute optical flow between frames and detect unnatural motion"""
+    try:
+        cap = cv2.VideoCapture(video_path)
+        prev_frame = None
+        flows = []
+        frame_count = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if prev_frame is not None:
+                flow = cv2.calcOpticalFlowFarneback(prev_frame, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+                mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
+                mean_mag = np.mean(mag)
+                flows.append(mean_mag)
+            prev_frame = gray
+            frame_count += 1
+            if frame_count >= 30:
+                break
+        cap.release()
+        if len(flows) < 2:
+            return {'score': 50, 'confidence': 30, 'details': 'Insufficient frames for flow'}
+        std_flow = np.std(flows)
+        max_flow = np.max(flows)
+        if std_flow < 0.5 or max_flow > 10:
+            score = 70
+        else:
+            score = 30
+        confidence = 60
+        return {
+            'score': score,
+            'confidence': confidence,
+            'mean_flow': np.mean(flows),
+            'std_flow': std_flow,
+            'max_flow': max_flow,
+            'details': f'Flow stats: mean={np.mean(flows):.2f}, std={std_flow:.2f}, max={max_flow:.2f}'
+        }
+    except Exception as e:
+        return {'score': 50, 'confidence': 0, 'error': str(e)}
+
+# ============================================================
 # Video Processing Functions
 # ============================================================
 
 def extract_frames(video_path, max_frames=30):
-    """Extract frames from video for temporal analysis"""
     frames = []
     cap = cv2.VideoCapture(video_path)
-
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     step = max(1, total_frames // max_frames)
-
     for i in range(0, total_frames, step):
         cap.set(cv2.CAP_PROP_POS_FRAMES, i)
         ret, frame = cap.read()
@@ -286,39 +482,29 @@ def extract_frames(video_path, max_frames=30):
             frames.append(Image.fromarray(frame))
         if len(frames) >= max_frames:
             break
-
     cap.release()
     return frames
 
 def temporal_consistency_check(frames):
-    """Check temporal consistency across video frames"""
     if len(frames) < 2:
         return {'score': 50, 'confidence': 0, 'details': 'Insufficient frames'}
-
     inconsistencies = []
     face_positions = []
-
     for i, frame in enumerate(frames):
         img_array = np.array(frame)
         faces, probs = mtcnn.detect(img_array)
-
         if faces is not None and len(faces) > 0:
             main_face = faces[0]
             face_positions.append(main_face)
-
             if i > 0:
                 prev_face = face_positions[i-1]
                 jump = np.abs(main_face - prev_face).mean()
                 inconsistencies.append(jump)
-
     if len(inconsistencies) == 0:
         return {'score': 50, 'confidence': 30, 'details': 'No faces tracked'}
-
     avg_inconsistency = np.mean(inconsistencies)
     max_jump = np.max(inconsistencies)
-
     is_fake = avg_inconsistency > 10 or max_jump > 30
-
     return {
         'score': min(100, avg_inconsistency * 3) if is_fake else max(0, 30 - avg_inconsistency),
         'confidence': min(90, len(inconsistencies) * 5),
@@ -329,18 +515,14 @@ def temporal_consistency_check(frames):
     }
 
 # ============================================================
-# Enhanced Analysis Function with Progress Tracking
+# Main Analysis Function (FIXED)
 # ============================================================
 
 def analyze_media(image=None, video=None, methods=None, progress=gr.Progress()):
-    """
-    Main analysis function with professional reporting
-    """
     if methods is None:
         methods = ["CLIP Analysis (Semantic)", "Frequency Analysis (Spectral)",
                    "Face Artifacts (Geometry)", "Noise Analysis (Sensor)"]
 
-    # Initialize results structure
     results = {
         'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         'methods_used': methods,
@@ -353,18 +535,15 @@ def analyze_media(image=None, video=None, methods=None, progress=gr.Progress()):
     all_scores = []
     confidences = []
     step_count = 0
-    total_steps = len(methods) + (1 if video else 0) + 2  # +2 for init and final
-
+    total_steps = len(methods) + (1 if video else 0) + 2
     progress(0, desc="Initializing DeepGuard...")
 
     # Process Image
     if image is not None:
         progress(0.1, desc="Loading image...")
-
         for method in methods:
             step_count += 1
             progress(step_count/total_steps, desc=f"Running {method}...")
-
             if method == "CLIP Analysis (Semantic)":
                 clip_res = detector.clip_analysis(image)
                 results['image_results']['clip'] = clip_res
@@ -375,7 +554,6 @@ def analyze_media(image=None, video=None, methods=None, progress=gr.Progress()):
                     'status': 'complete',
                     'indicators': ['Semantic consistency', 'Context coherence']
                 })
-
             elif method == "Frequency Analysis (Spectral)":
                 freq_res = detector.frequency_analysis(image)
                 results['image_results']['frequency'] = freq_res
@@ -386,7 +564,6 @@ def analyze_media(image=None, video=None, methods=None, progress=gr.Progress()):
                     'status': 'complete',
                     'indicators': ['High-frequency artifacts', 'GAN fingerprints']
                 })
-
             elif method == "Face Artifacts (Geometry)":
                 face_res = detector.face_artifact_detection(image)
                 results['image_results']['face_artifacts'] = face_res
@@ -397,7 +574,6 @@ def analyze_media(image=None, video=None, methods=None, progress=gr.Progress()):
                     'status': 'complete',
                     'indicators': ['Asymmetry detection', 'Edge coherence', 'Color consistency']
                 })
-
             elif method == "Noise Analysis (Sensor)":
                 noise_res = detector.noise_analysis(image)
                 results['image_results']['noise'] = noise_res
@@ -408,34 +584,103 @@ def analyze_media(image=None, video=None, methods=None, progress=gr.Progress()):
                     'status': 'complete',
                     'indicators': ['Noise consistency', 'Statistical distribution']
                 })
+            elif method == "Hand Analysis (Finger Count)":
+                hand_res = hand_analysis(image)
+                results['image_results']['hand'] = hand_res
+                all_scores.append(hand_res['score'])
+                confidences.append(hand_res['confidence'])
+                results['processing_steps'].append({
+                    'method': 'Hand Analysis',
+                    'status': 'complete',
+                    'indicators': ['Finger count', 'Hand geometry']
+                })
+            elif method == "Watermark Detection":
+                wm_res = watermark_analysis(image)
+                results['image_results']['watermark'] = wm_res
+                all_scores.append(wm_res['score'])
+                confidences.append(wm_res['confidence'])
+                results['processing_steps'].append({
+                    'method': 'Watermark Detection',
+                    'status': 'complete',
+                    'indicators': ['Text detection', 'Removal artifacts']
+                })
+            elif method == "Texture Analysis (Face)":
+                tex_res = texture_analysis(image)
+                results['image_results']['texture'] = tex_res
+                all_scores.append(tex_res['score'])
+                confidences.append(tex_res['confidence'])
+                results['processing_steps'].append({
+                    'method': 'Texture Analysis',
+                    'status': 'complete',
+                    'indicators': ['LBP entropy', 'Smoothness']
+                })
+            elif method == "ViT Feature Analysis":
+                vit_res = vit_analysis(image)
+                results['image_results']['vit'] = vit_res
+                all_scores.append(vit_res['score'])
+                confidences.append(vit_res['confidence'])
+                results['processing_steps'].append({
+                    'method': 'Vision Transformer Analysis',
+                    'status': 'complete',
+                    'indicators': ['Deep features', 'Entropy measure']
+                })
+            elif method == "Metadata Analysis":
+                meta_res = metadata_analysis(image)
+                results['image_results']['metadata'] = meta_res
+                all_scores.append(meta_res['score'])
+                confidences.append(meta_res['confidence'])
+                results['processing_steps'].append({
+                    'method': 'Metadata Analysis',
+                    'status': 'complete',
+                    'indicators': ['EXIF presence', 'Compression artifacts']
+                })
 
     # Process Video
     if video is not None:
         step_count += 1
-        progress(step_count/total_steps, desc="Processing video frames...")
+        progress(step_count/total_steps, desc="Processing video...")
 
         try:
+            # ---- Robust video file handling ----
+            if isinstance(video, str):
+                video_path = video
+            else:
+                video_path = video.name if hasattr(video, 'name') else str(video)
+
+            # Create a temporary copy with a .mp4 extension
             with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
-                tmp.write(video)
+                if not os.path.exists(video_path):
+                    if hasattr(video, 'read'):
+                        tmp.write(video.read())
+                    else:
+                        tmp.write(video)
+                else:
+                    with open(video_path, 'rb') as f:
+                        tmp.write(f.read())
                 tmp_path = tmp.name
 
+            # Extract frames
             frames = extract_frames(tmp_path, max_frames=20)
-            os.unlink(tmp_path)
 
-            frame_scores = []
+            if not frames:
+                raise Exception("No frames could be extracted from the video.")
+
+            # Analyze first 5 frames with CLIP
             for idx, frame in enumerate(frames[:5]):
                 progress((step_count + idx*0.1)/total_steps, desc=f"Analyzing frame {idx+1}/5...")
                 clip_res = detector.clip_analysis(frame)
-                frame_scores.append(clip_res['score'])
+                # Append both score and confidence for this frame
+                all_scores.append(clip_res['score'])
+                confidences.append(clip_res['confidence'])
 
+            # Temporal consistency
             temporal_res = temporal_consistency_check(frames)
             results['video_results']['temporal'] = temporal_res
             results['video_results']['frame_samples'] = len(frames)
-            results['video_results']['avg_frame_score'] = round(np.mean(frame_scores), 2)
+            results['video_results']['avg_frame_score'] = round(np.mean([s for s in all_scores[-5:]]), 2)
 
             all_scores.append(temporal_res['score'])
             confidences.append(temporal_res['confidence'])
-            all_scores.extend(frame_scores)
 
             results['processing_steps'].append({
                 'method': 'Temporal Consistency Check',
@@ -443,23 +688,56 @@ def analyze_media(image=None, video=None, methods=None, progress=gr.Progress()):
                 'indicators': ['Frame-to-frame jitter', 'Face tracking stability']
             })
 
+            # Optical flow if selected
+            if "Optical Flow Analysis" in methods:
+                # Create a new temp file for optical flow
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp2:
+                    with open(video_path, 'rb') as f:
+                        tmp2.write(f.read())
+                    tmp2_path = tmp2.name
+                flow_res = optical_flow_analysis(tmp2_path)
+                os.unlink(tmp2_path)
+                results['video_results']['optical_flow'] = flow_res
+                all_scores.append(flow_res['score'])
+                confidences.append(flow_res['confidence'])
+                results['processing_steps'].append({
+                    'method': 'Optical Flow Analysis',
+                    'status': 'complete',
+                    'indicators': ['Motion consistency', 'Flow magnitude']
+                })
+
+            # Clean up the main temp file
+            os.unlink(tmp_path)
+
         except Exception as e:
-            results['video_results']['error'] = str(e)
+            import traceback
+            error_trace = traceback.format_exc()
+            results['video_results']['error'] = error_trace
+            results['processing_steps'].append({
+                'method': 'Video Processing',
+                'status': 'error',
+                'indicators': [str(e)]
+            })
+            print(error_trace)  # Log to Hugging Face console
 
     # Calculate Final Verdict
     step_count += 1
     progress(step_count/total_steps, desc="Computing final verdict...")
 
     if all_scores:
-        weights = np.array(confidences) / 100.0
+        # Ensure both arrays have the same length
+        if len(all_scores) != len(confidences):
+            # Fallback to equal weights
+            print(f"Warning: all_scores length {len(all_scores)} != confidences length {len(confidences)}. Using equal weights.")
+            weights = np.ones(len(all_scores)) / len(all_scores)
+        else:
+            weights = np.array(confidences) / 100.0
         weighted_score = np.average(all_scores, weights=weights)
 
         fake_votes = sum(1 for s in all_scores if s > 60)
         total_votes = len(all_scores)
-
         authenticity = 100 - weighted_score
 
-        # Determine risk level and verdict
         if weighted_score > 70:
             verdict = "AI-GENERATED / DEEPFAKE"
             risk_level = "CRITICAL"
@@ -487,10 +765,7 @@ def analyze_media(image=None, video=None, methods=None, progress=gr.Progress()):
             'risk_color': risk_color
         }
     else:
-        results['final_verdict'] = {
-            'error': 'No analysis completed',
-            'verdict': 'UNKNOWN'
-        }
+        results['final_verdict'] = {'error': 'No analysis completed', 'verdict': 'UNKNOWN'}
 
     # Generate heatmap
     heatmap = None
@@ -500,397 +775,428 @@ def analyze_media(image=None, video=None, methods=None, progress=gr.Progress()):
 
     progress(1.0, desc="Analysis complete!")
 
-    # Format professional outputs
+    # Build HTML output (same as before)
     verdict = results['final_verdict']
 
-    # Build detailed method cards HTML
     method_cards = ""
     for method_key, method_data in results['image_results'].items():
         if 'error' not in method_data:
             score = method_data.get('score', 0)
             confidence = method_data.get('confidence', 0)
-
             if score > 60:
-                status_icon = "⚠️"
-                card_border = "border-red-500"
-                bg_color = "bg-red-50"
+                status_icon = "🔴"
+                card_border = "#b91c1c"
+                bg_color = "#2d1a1a"
+                text_color = "#fecaca"
             elif score > 40:
-                status_icon = "⚡"
-                card_border = "border-yellow-500"
-                bg_color = "bg-yellow-50"
+                status_icon = "🟡"
+                card_border = "#a16207"
+                bg_color = "#2a2416"
+                text_color = "#fde68a"
             else:
-                status_icon = "✓"
-                card_border = "border-green-500"
-                bg_color = "bg-green-50"
+                status_icon = "🟢"
+                card_border = "#166534"
+                bg_color = "#1a2e1a"
+                text_color = "#bbf7d0"
 
             method_name = {
-                'clip': 'CLIP Semantic',
+                'clip': 'CLIP Semantic Analysis',
                 'frequency': 'Spectral Analysis',
                 'face_artifacts': 'Facial Geometry',
-                'noise': 'Noise Patterns'
+                'noise': 'Noise Patterns',
+                'hand': 'Hand Analysis',
+                'watermark': 'Watermark Detection',
+                'texture': 'Texture Analysis',
+                'vit': 'Vision Transformer Analysis',
+                'metadata': 'Metadata Analysis'
             }.get(method_key, method_key)
 
             method_cards += f"""
-            <div class="method-card {bg_color} border-l-4 {card_border} p-3 rounded mb-2">
-                <div class="flex justify-between items-center">
-                    <span class="font-semibold text-sm">{status_icon} {method_name}</span>
-                    <span class="text-xs font-mono bg-white px-2 py-1 rounded border">{score:.1f}% synthetic</span>
+            <div style="background:{bg_color}; border-left:6px solid {card_border}; padding:1rem; border-radius:8px; margin-bottom:0.75rem; box-shadow:0 2px 4px rgba(0,0,0,0.3);">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <span style="font-weight:600; font-size:0.95rem; color:{text_color};">{status_icon} {method_name}</span>
+                    <span style="background:#1f2937; color:#e5e7eb; padding:0.25rem 0.75rem; border-radius:20px; font-size:0.85rem; font-weight:500; border:1px solid #4b5563;">{score:.1f}% synthetic</span>
                 </div>
-                <div class="text-xs text-gray-600 mt-1">Confidence: {confidence:.1f}%</div>
+                <div style="font-size:0.85rem; color:#9ca3af; margin-top:0.5rem;">Confidence: {confidence:.1f}%</div>
             </div>
             """
 
-    # Main verdict display with gauge
-    score_display = f"""
-    <div class="verdict-container" style="font-family: 'Inter', system-ui, sans-serif;">
-        <div class="verdict-header" style="background: linear-gradient(135deg, {verdict.get('risk_color', '#666')}20, {verdict.get('risk_color', '#666')}05);
-             border-left: 6px solid {verdict.get('risk_color', '#666')};
-             padding: 1.5rem; border-radius: 12px; margin-bottom: 1.5rem;">
-
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
-                <h2 style="margin: 0; font-size: 1.25rem; font-weight: 700; color: {verdict.get('risk_color', '#666')};">
-                    {verdict.get('verdict', 'UNKNOWN')}
-                </h2>
-                <span style="background: {verdict.get('risk_color', '#666')}; color: white; padding: 0.25rem 0.75rem;
-                      border-radius: 9999px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;">
-                    Risk: {verdict.get('risk_level', 'N/A')}
-                </span>
-            </div>
-
-            <div style="font-size: 0.875rem; color: #4b5563; margin-bottom: 1rem;">
-                {verdict.get('algorithm_agreement', 'N/A')} detection methods flagged anomalies
-            </div>
-
-            <!-- Gauge visualization -->
-            <div style="background: #e5e7eb; height: 8px; border-radius: 4px; overflow: hidden; margin-bottom: 0.5rem;">
-                <div style="background: linear-gradient(90deg, #16a34a 0%, #ca8a04 50%, #dc2626 100%);
-                     width: {verdict.get('fake_probability', 50)}%; height: 100%;
-                     transition: width 0.5s ease; position: relative;">
+    for method_key, method_data in results['video_results'].items():
+        if method_key != 'error' and isinstance(method_data, dict):
+            score = method_data.get('score', 0)
+            confidence = method_data.get('confidence', 0)
+            if score > 60:
+                status_icon = "🔴"
+                card_border = "#b91c1c"
+                bg_color = "#2d1a1a"
+                text_color = "#fecaca"
+            elif score > 40:
+                status_icon = "🟡"
+                card_border = "#a16207"
+                bg_color = "#2a2416"
+                text_color = "#fde68a"
+            else:
+                status_icon = "🟢"
+                card_border = "#166534"
+                bg_color = "#1a2e1a"
+                text_color = "#bbf7d0"
+            method_name = method_key.replace('_', ' ').title()
+            method_cards += f"""
+            <div style="background:{bg_color}; border-left:6px solid {card_border}; padding:1rem; border-radius:8px; margin-bottom:0.75rem; box-shadow:0 2px 4px rgba(0,0,0,0.3);">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <span style="font-weight:600; font-size:0.95rem; color:{text_color};">{status_icon} {method_name}</span>
+                    <span style="background:#1f2937; color:#e5e7eb; padding:0.25rem 0.75rem; border-radius:20px; font-size:0.85rem; font-weight:500; border:1px solid #4b5563;">{score:.1f}% synthetic</span>
                 </div>
+                <div style="font-size:0.85rem; color:#9ca3af; margin-top:0.5rem;">Confidence: {confidence:.1f}%</div>
             </div>
+            """
 
-            <div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: #6b7280; font-weight: 500;">
+    score_display = f"""
+    <div style="font-family: 'Inter', system-ui, sans-serif; color: #e5e7eb;">
+        <div style="background: linear-gradient(135deg, {verdict.get('risk_color', '#666')}25, {verdict.get('risk_color', '#666')}10); border:1px solid {verdict.get('risk_color', '#666')}60; border-radius:20px; padding:1.5rem; margin-bottom:2rem;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+                <h2 style="margin:0; font-size:1.8rem; font-weight:700; color:{verdict.get('risk_color', '#e5e7eb')};">{verdict.get('verdict', 'UNKNOWN')}</h2>
+                <span style="background:{verdict.get('risk_color', '#666')}; color:white; padding:0.25rem 1rem; border-radius:40px; font-size:0.85rem; font-weight:600; text-transform:uppercase;">{verdict.get('risk_level', 'N/A')} RISK</span>
+            </div>
+            <p style="font-size:1rem; color:#d1d5db; margin-bottom:1.5rem;">{verdict.get('algorithm_agreement', 'N/A')} detection methods flagged anomalies</p>
+            <div style="background:#374151; height:12px; border-radius:20px; overflow:hidden; margin-bottom:0.5rem;">
+                <div style="background:linear-gradient(90deg, #16a34a 0%, #ca8a04 50%, #dc2626 100%); width:{verdict.get('fake_probability', 50)}%; height:100%; transition:width 0.5s ease;"></div>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:0.9rem; color:#9ca3af;">
                 <span>Authentic ({100 - verdict.get('fake_probability', 50):.1f}%)</span>
                 <span>Synthetic ({verdict.get('fake_probability', 50):.1f}%)</span>
             </div>
         </div>
 
-        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem;">
-            <div style="background: #f9fafb; padding: 1rem; border-radius: 8px; border: 1px solid #e5e7eb;">
-                <div style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; margin-bottom: 0.25rem;">
-                    Confidence Score
-                </div>
-                <div style="font-size: 1.5rem; font-weight: 700; color: #111827;">
-                    {verdict.get('confidence', 0):.1f}%
-                </div>
+        <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:1rem; margin-bottom:2rem;">
+            <div style="background:#1f2937; padding:1.25rem; border-radius:16px; box-shadow:0 4px 12px rgba(0,0,0,0.3); border:1px solid #374151;">
+                <div style="font-size:0.8rem; text-transform:uppercase; color:#9ca3af; margin-bottom:0.5rem;">Confidence</div>
+                <div style="font-size:2rem; font-weight:700; color:#f3f4f6;">{verdict.get('confidence', 0):.1f}%</div>
             </div>
-
-            <div style="background: #f9fafb; padding: 1rem; border-radius: 8px; border: 1px solid #e5e7eb;">
-                <div style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; margin-bottom: 0.25rem;">
-                    Analysis Methods
-                </div>
-                <div style="font-size: 1.5rem; font-weight: 700; color: #111827;">
-                    {len(results['image_results']) + len(results['video_results'])}
-                </div>
+            <div style="background:#1f2937; padding:1.25rem; border-radius:16px; box-shadow:0 4px 12px rgba(0,0,0,0.3); border:1px solid #374151;">
+                <div style="font-size:0.8rem; text-transform:uppercase; color:#9ca3af; margin-bottom:0.5rem;">Methods</div>
+                <div style="font-size:2rem; font-weight:700; color:#f3f4f6;">{len(results['image_results']) + len(results['video_results'])}</div>
             </div>
-
-            <div style="background: #f9fafb; padding: 1rem; border-radius: 8px; border: 1px solid #e5e7eb;">
-                <div style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; margin-bottom: 0.25rem;">
-                    Timestamp
-                </div>
-                <div style="font-size: 0.875rem; font-weight: 600; color: #111827;">
-                    {results['timestamp']}
-                </div>
+            <div style="background:#1f2937; padding:1.25rem; border-radius:16px; box-shadow:0 4px 12px rgba(0,0,0,0.3); border:1px solid #374151;">
+                <div style="font-size:0.8rem; text-transform:uppercase; color:#9ca3af; margin-bottom:0.5rem;">Analyzed</div>
+                <div style="font-size:1rem; font-weight:600; color:#f3f4f6;">{results['timestamp']}</div>
             </div>
         </div>
 
-        <h3 style="font-size: 1rem; font-weight: 600; margin-bottom: 0.75rem; color: #111827;">Detection Method Details</h3>
-        {method_cards if method_cards else '<div style="color: #6b7280; font-size: 0.875rem;">No detailed method results available</div>'}
+        <h3 style="font-size:1.25rem; font-weight:600; margin-bottom:1rem; color:#f3f4f6;">🔍 Method Details</h3>
+        {method_cards if method_cards else '<div style="color:#9ca3af; font-size:0.95rem;">No detailed method results available</div>'}
     </div>
     """
 
-    # Technical details JSON
     details_json = json.dumps(results, indent=2, default=str)
-
-    # Processing steps summary
-    steps_summary = "\n".join([
-        f"✓ {step['method']}: {', '.join(step['indicators'][:2])}"
-        for step in results['processing_steps']
-    ])
+    steps_summary = "\n".join([f"✅ {step['method']}: {', '.join(step['indicators'][:2])}" for step in results['processing_steps']])
 
     return score_display, heatmap, details_json, steps_summary
 
 # ============================================================
-# Professional Gradio Interface 
+# Gradio Interface
 # ============================================================
 
 custom_css = """
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+@import url('https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css');
+
+* { box-sizing: border-box; }
 
 .gradio-container {
-    font-family: 'Inter', system-ui, -apple-system, sans-serif !important;
-    max-width: 1200px !important;
+    font-family: 'Inter', sans-serif !important;
+    max-width: 1400px !important;
     margin: 0 auto !important;
+    background: #0f172a !important;
+    padding: 2rem !important;
 }
 
-/* Header styling */
 .main-header {
-    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+    background: linear-gradient(145deg, #0b1120 0%, #1a2639 100%);
     color: white;
-    padding: 2rem;
-    border-radius: 16px;
-    margin-bottom: 2rem;
-    text-align: center;
-    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+    padding: 2.5rem;
+    border-radius: 32px;
+    margin-bottom: 2.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+    border: 1px solid #334155;
 }
 
 .main-header h1 {
-    margin: 0 0 0.5rem 0;
-    font-size: 2.5rem;
-    font-weight: 700;
-    background: linear-gradient(90deg, #60a5fa, #a78bfa);
+    margin: 0;
+    font-size: 2.8rem;
+    font-weight: 800;
+    background: linear-gradient(135deg, #a5f3fc, #c084fc);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
+    letter-spacing: -0.02em;
 }
 
 .main-header p {
-    margin: 0;
-    color: #94a3b8;
-    font-size: 1.125rem;
+    margin: 0.5rem 0 0 0;
+    color: #9aa4b9;
+    font-size: 1.1rem;
 }
 
-/* Input panel */
 .input-panel {
-    background: #ffffff;
-    border: 1px solid #e2e8f0;
-    border-radius: 12px;
-    padding: 1.5rem;
-    box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);
+    background: #1e293b;
+    border-radius: 28px;
+    padding: 2rem;
+    box-shadow: 0 20px 40px -12px rgba(0,0,0,0.5);
+    border: 1px solid #334155;
+    height: fit-content;
 }
 
-/* Method cards in results */
-.method-card {
-    transition: all 0.2s ease;
+.input-panel h3 {
+    font-size: 1.3rem;
+    font-weight: 600;
+    margin-top: 0;
+    margin-bottom: 1.5rem;
+    color: #f1f5f9;
 }
 
-.method-card:hover {
-    transform: translateX(4px);
-    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-}
-
-/* Buttons */
-.primary-btn {
-    background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%) !important;
-    border: none !important;
-    border-radius: 8px !important;
-    font-weight: 600 !important;
-    padding: 0.75rem 2rem !important;
-    transition: all 0.2s !important;
-}
-
-.primary-btn:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 10px 15px -3px rgba(59, 130, 246, 0.3) !important;
-}
-
-/* Tabs */
 .tab-nav {
-    border-bottom: 2px solid #e2e8f0 !important;
+    border-bottom: 2px solid #334155 !important;
+    margin-bottom: 1.5rem !important;
+}
+
+.tab-nav button {
+    font-weight: 600 !important;
+    font-size: 1rem !important;
+    padding: 0.75rem 1.5rem !important;
+    color: #94a3b8 !important;
 }
 
 .tab-selected {
-    border-bottom: 2px solid #3b82f6 !important;
-    color: #2563eb !important;
+    border-bottom: 3px solid #3b82f6 !important;
+    color: #60a5fa !important;
+}
+
+.primary-btn {
+    background: linear-gradient(145deg, #1e3a8a, #2563eb) !important;
+    border: none !important;
+    border-radius: 60px !important;
     font-weight: 600 !important;
+    padding: 0.9rem 2.5rem !important;
+    font-size: 1.1rem !important;
+    box-shadow: 0 10px 20px -5px #1e3a8a80 !important;
+    transition: all 0.2s !important;
+    width: 100%;
+    margin-top: 1rem;
+    color: white !important;
 }
 
-/* Status badges */
-.status-badge {
-    display: inline-flex;
-    align-items: center;
-    padding: 0.25rem 0.75rem;
-    border-radius: 9999px;
-    font-size: 0.75rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+.primary-btn:hover {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 20px 30px -5px #1e3a8a !important;
 }
 
-/* Image containers */
-.image-preview {
-    border-radius: 12px;
-    overflow: hidden;
-    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-}
-
-/* JSON viewer */
-.json-viewer {
-    background: #0f172a !important;
+.secondary-btn {
+    background: #334155 !important;
+    border: 1px solid #475569 !important;
+    border-radius: 60px !important;
     color: #e2e8f0 !important;
-    border-radius: 8px !important;
-    font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
-    font-size: 0.875rem !important;
+    font-weight: 500 !important;
+    padding: 0.75rem 2rem !important;
+    width: 100%;
+    margin-top: 0.75rem;
 }
 
-/* Progress bar customization */
-.progress-track {
-    background: #e2e8f0;
-    border-radius: 9999px;
+.secondary-btn:hover {
+    background: #3b4a5c !important;
+}
+
+.gr-checkbox-group {
+    background: #1e293b !important;
+    border-radius: 20px;
+    padding: 1rem;
+    border: 1px solid #334155;
+    color: #e2e8f0;
+}
+
+.gr-checkbox-group span {
+    color: #e2e8f0 !important;
+}
+
+.results-panel {
+    background: #1e293b;
+    border-radius: 28px;
+    padding: 2rem;
+    box-shadow: 0 20px 40px -12px rgba(0,0,0,0.5);
+    border: 1px solid #334155;
+    min-height: 600px;
+}
+
+.results-panel h3, .results-panel .gr-markdown {
+    color: #f1f5f9;
+}
+
+.image-preview {
+    border-radius: 24px;
     overflow: hidden;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.3);
+    border: 1px solid #334155;
 }
 
-.progress-fill {
-    background: linear-gradient(90deg, #3b82f6, #8b5cf6);
-    height: 100%;
-    transition: width 0.3s ease;
+.json-viewer {
+    background: #0b1120 !important;
+    color: #e2e8f0 !important;
+    border-radius: 16px !important;
+    padding: 1.5rem !important;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
+    font-size: 0.9rem !important;
+    border: 1px solid #334155;
 }
 
-/* Footer */
 .footer {
     margin-top: 3rem;
-    padding-top: 2rem;
-    border-top: 1px solid #e2e8f0;
+    padding: 2rem;
+    background: #1e293b;
+    border-radius: 28px;
+    border: 1px solid #334155;
     text-align: center;
-    color: #64748b;
-    font-size: 0.875rem;
+    color: #9ca3af;
+    font-size: 0.95rem;
+    display: flex;
+    justify-content: center;
+    gap: 2rem;
+    flex-wrap: wrap;
 }
 
-/* Responsive adjustments */
-@media (max-width: 768px) {
-    .main-header h1 {
-        font-size: 1.875rem;
-    }
+.footer a {
+    color: #60a5fa;
+    text-decoration: none;
+    font-weight: 500;
+}
 
-    .main-header {
-        padding: 1.5rem;
-    }
+@media (max-width: 768px) {
+    .gradio-container { padding: 1rem !important; }
+    .main-header { flex-direction: column; text-align: center; gap: 1rem; }
+    .main-header h1 { font-size: 2rem; }
+}
+
+.gr-box, .gr-form, .gr-panel, .gr-group, .gr-input, .gr-text-input, .gr-dropdown, .gr-number-input, .gr-slider, .gr-checkbox, .gr-radio, .gr-textarea, .gr-output, .gr-dataframe, .gr-json {
+    color: #e2e8f0 !important;
+    background-color: #1e293b !important;
+    border-color: #334155 !important;
+}
+
+.gr-input-label, .gr-label {
+    color: #cbd5e1 !important;
+}
+
+.tabs {
+    background: #1e293b !important;
+}
+
+.progress-text {
+    color: #9ca3af !important;
+}
+
+.gr-tooltip {
+    background: #334155 !important;
+    color: #f3f4f6 !important;
+    border: 1px solid #475569;
+}
+
+.gr-markdown {
+    color: #e2e8f0 !important;
 }
 """
 
-with gr.Blocks(css=custom_css, title="DeepGuard - AI Media Forensics", theme=gr.themes.Soft()) as demo:
-
-    # Header
+with gr.Blocks(css=custom_css, title="DeepGuard - AI Media Forensics") as demo:
     gr.HTML("""
     <div class="main-header">
-        <h1>🛡️ DeepGuard</h1>
-        <p>Advanced AI-Generated Media Detection & Forensic Analysis</p>
+        <div>
+            <h1>🛡️ DeepGuard</h1>
+            <p>Advanced AI-Generated Media Detection & Forensic Analysis</p>
+        </div>
     </div>
     """)
 
     with gr.Row(equal_height=True):
-        # Left Column - Inputs
-        with gr.Column(scale=1, elem_classes="input-panel"):
-            gr.Markdown("### 📤 Upload Media for Analysis")
-
+        with gr.Column(scale=4, elem_classes="input-panel"):
+            gr.Markdown("### 📤 Upload Media")
             with gr.Tabs():
-                with gr.TabItem("🖼️ Image Analysis", id=0):
-                    image_input = gr.Image(
-                        label="Upload Image (JPG, PNG, WEBP)",
-                        type="pil",
-                        height=350,
-                        elem_classes="image-preview",
-                        show_label=True
-                    )
-
+                with gr.TabItem("🖼️ Image"):
+                    image_input = gr.Image(type="pil", height=300, elem_classes="image-preview", show_label=False)
                     gr.Markdown("""
-                    <div style="margin-top: 0.5rem; padding: 0.75rem; background: #f8fafc; border-radius: 8px; font-size: 0.875rem; color: #475569;">
-                        <strong>💡 Tip:</strong> For best results, use high-resolution images with visible faces. The system analyzes facial geometry, noise patterns, and semantic consistency.
+                    <div style="margin-top: 0.5rem; padding: 0.75rem; background: #1f2937; border-radius: 16px; font-size: 0.9rem; color: #9ca3af; border:1px solid #374151;">
+                        <i class="fas fa-lightbulb" style="color: #f59e0b; margin-right: 8px;"></i>
+                        <strong style="color:#e2e8f0;">Tip:</strong> High‑resolution images with faces yield best results.
                     </div>
                     """)
-
-                with gr.TabItem("🎬 Video Analysis", id=1):
-                    video_input = gr.File(
-                        label="Upload Video (MP4, MOV, AVI)",
-                        file_types=[".mp4", ".mov", ".avi", ".mkv"],
-                        height=350
-                    )
-
+                with gr.TabItem("🎬 Video"):
+                    video_input = gr.File(file_types=[".mp4", ".mov", ".avi", ".mkv"], height=300)
                     gr.Markdown("""
-                    <div style="margin-top: 0.5rem; padding: 0.75rem; background: #f8fafc; border-radius: 8px; font-size: 0.875rem; color: #475569;">
-                        <strong>⚠️ Note:</strong> Video analysis samples 20 frames and checks temporal consistency. Processing may take 30-60 seconds depending on duration.
+                    <div style="margin-top: 0.5rem; padding: 0.75rem; background: #1f2937; border-radius: 16px; font-size: 0.9rem; color: #9ca3af; border:1px solid #374151;">
+                        <i class="fas fa-clock" style="color: #3b82f6; margin-right: 8px;"></i>
+                        <strong style="color:#e2e8f0;">Processing may take 30‑60 seconds.</strong>
                     </div>
                     """)
 
             gr.Markdown("### 🔬 Detection Methods")
-
             method_check = gr.CheckboxGroup(
                 choices=[
                     "CLIP Analysis (Semantic)",
                     "Frequency Analysis (Spectral)",
                     "Face Artifacts (Geometry)",
                     "Noise Analysis (Sensor)",
-                    "Temporal Consistency (Video)"
+                    "Hand Analysis (Finger Count)",
+                    "Watermark Detection",
+                    "Texture Analysis (Face)",
+                    "ViT Feature Analysis",
+                    "Metadata Analysis",
+                    "Temporal Consistency (Video)",
+                    "Optical Flow Analysis"
                 ],
                 value=[
                     "CLIP Analysis (Semantic)",
                     "Frequency Analysis (Spectral)",
                     "Face Artifacts (Geometry)",
-                    "Noise Analysis (Sensor)"
+                    "Noise Analysis (Sensor)",
+                    "Hand Analysis (Finger Count)",
+                    "Watermark Detection",
+                    "Texture Analysis (Face)"
                 ],
-                label="Active Detection Algorithms",
-                info="Select forensic methods to apply. More methods = higher accuracy but slower processing."
+                label="",
+                info="Select methods (more = higher accuracy, slower)"
             )
 
-            analyze_btn = gr.Button(
-                "🔍 Start Forensic Analysis",
-                variant="primary",
-                elem_classes="primary-btn",
-                scale=1
-            )
+            analyze_btn = gr.Button("🔍 Start Forensic Analysis", variant="primary", elem_classes="primary-btn")
+            clear_btn = gr.Button("🔄 Clear & Reset", elem_classes="secondary-btn")
 
-            clear_btn = gr.Button("🔄 Clear & Reset", variant="secondary", size="sm")
-
-        # Right Column - Results
-        with gr.Column(scale=1):
+        with gr.Column(scale=6, elem_classes="results-panel"):
             gr.Markdown("### 📊 Forensic Report")
-
             with gr.Tabs():
-                with gr.TabItem("🎯 Verdict", id=0):
-                    score_output = gr.HTML(label="Analysis Results")
-
+                with gr.TabItem("🎯 Verdict"):
+                    score_output = gr.HTML(label="")
                     with gr.Row():
-                        with gr.Column(scale=1):
-                            heatmap_output = gr.Image(
-                                label="Anomaly Heatmap",
-                                height=280,
-                                elem_classes="image-preview",
-                                show_label=True
-                            )
-                        with gr.Column(scale=1):
-                            steps_output = gr.Textbox(
-                                label="Processing Steps",
-                                lines=8,
-                                interactive=False,
-                                value="Awaiting analysis..."
-                            )
-
-                with gr.TabItem("🔬 Technical Data", id=1):
-                    json_output = gr.Code(
-                        label="Raw Detection Data (JSON)",
-                        language="json",
-                        elem_classes="json-viewer",
-                        lines=20
-                    )
-
+                        with gr.Column(scale=5):
+                            heatmap_output = gr.Image(label="Anomaly Heatmap", height=260, elem_classes="image-preview", show_label=True)
+                        with gr.Column(scale=5):
+                            steps_output = gr.Textbox(label="Processing Steps", lines=7, interactive=False, value="Awaiting analysis...")
+                with gr.TabItem("🔬 Technical Data"):
+                    json_output = gr.Code(label="Raw Detection Data (JSON)", language="json", elem_classes="json-viewer", lines=18)
                     gr.Markdown("""
-                    <div style="margin-top: 1rem; padding: 1rem; background: #fef3c7; border-left: 4px solid #f59e0b; border-radius: 8px; font-size: 0.875rem;">
-                        <strong>⚠️ Developer Notice:</strong> Raw scores above 60% indicate synthetic content probability. Cross-reference multiple methods for high-confidence verdicts.
+                    <div style="margin-top: 1rem; padding: 1rem; background: #1f2937; border-left: 6px solid #f59e0b; border-radius: 12px; font-size: 0.9rem; color: #9ca3af;">
+                        <i class="fas fa-exclamation-triangle" style="color: #f59e0b; margin-right: 8px;"></i>
+                        <strong style="color:#e2e8f0;">Note:</strong> Scores above 60% indicate synthetic content. Always cross‑check multiple methods.
                     </div>
                     """)
 
-    # Footer
     gr.HTML("""
     <div class="footer">
-        <p><strong>DeepGuard Forensic Suite v1.0</strong> • Powered by CLIP, EfficientNet & Computer Vision</p>
-        <p style="margin-top: 0.5rem; font-size: 0.75rem;">
-            ⚠️ <strong>Ethical Use Required:</strong> This tool is for security research, content verification, and educational purposes only.
-            Results are probabilistic and should be combined with human expert analysis for legal or journalistic verification.
-        </p>
+        <span><i class="fas fa-copyright"></i> 2026 DeepGuard · Forensic Suite</span>
+        <span><i class="fas fa-code-branch"></i> v1.0.0</span>
+        <span><i class="fas fa-flask"></i> Research Use Only</span>
+        <span><a href="#" target="_blank"><i class="fab fa-github"></i> GitHub</a></span>
     </div>
     """)
 
-    # Event Handlers
     analyze_btn.click(
         fn=analyze_media,
         inputs=[image_input, video_input, method_check],
@@ -906,9 +1212,5 @@ with gr.Blocks(css=custom_css, title="DeepGuard - AI Media Forensics", theme=gr.
         outputs=[image_input, video_input, method_check, score_output, heatmap_output, steps_output, json_output]
     )
 
-# ============================================================
-# Launch for Hugging Face Spaces
-# ============================================================
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0")
-    
