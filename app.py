@@ -1,8 +1,10 @@
 # ============================================================
 # DEEPGUARD: AI FAKE IMAGE & VIDEO DETECTOR
-# Advanced Version with Video Fix & Weighted Average Fix
+# Robust version for Render – handles missing imports, port binding
 # ============================================================
 
+import os
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,13 +23,25 @@ import json
 from scipy import fftpack
 from collections import defaultdict
 import tempfile
-import os
 import pandas as pd
 from datetime import datetime
 from skimage.feature import local_binary_pattern
 from skimage import exposure
-import easyocr
-import mediapipe as mp
+
+# Optional imports – fail gracefully if not installed
+try:
+    import easyocr
+    EASYOCR_AVAILABLE = True
+except ImportError:
+    EASYOCR_AVAILABLE = False
+    print("EasyOCR not installed. Watermark detection will use frequency analysis only.")
+
+try:
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    MEDIAPIPE_AVAILABLE = False
+    print("MediaPipe not installed. Hand analysis will be disabled.")
 
 warnings.filterwarnings('ignore')
 
@@ -287,11 +301,13 @@ detector = DeepfakeDetector()
 print("✅ Detector initialized!")
 
 # ============================================================
-# Advanced Detection Functions
+# Advanced Detection Functions (with graceful fallback)
 # ============================================================
 
 def hand_analysis(image):
-    """Count fingers and detect hand anomalies using MediaPipe"""
+    """Count fingers and detect hand anomalies using MediaPipe (if available)"""
+    if not MEDIAPIPE_AVAILABLE:
+        return {'score': 50, 'confidence': 30, 'details': 'MediaPipe not installed', 'fingers_count': 0}
     try:
         mp_hands = mp.solutions.hands
         hands = mp_hands.Hands(static_image_mode=True, max_num_hands=2, min_detection_confidence=0.5)
@@ -327,13 +343,20 @@ def hand_analysis(image):
         return {'score': 50, 'confidence': 0, 'error': str(e)}
 
 def watermark_analysis(image):
-    """Detect watermarks or signs of removal using OCR and frequency analysis"""
+    """Detect watermarks or signs of removal using OCR (if available) and frequency analysis"""
     try:
-        reader = easyocr.Reader(['en'], gpu=False)
+        # OCR part only if easyocr is available
+        text_found = False
+        text_details = []
+        if EASYOCR_AVAILABLE:
+            reader = easyocr.Reader(['en'], gpu=False)
+            img_array = np.array(image)
+            result = reader.readtext(img_array)
+            text_found = len(result) > 0
+            text_details = [item[1] for item in result]
+
+        # Frequency analysis (always works)
         img_array = np.array(image)
-        result = reader.readtext(img_array)
-        text_found = len(result) > 0
-        text_details = [item[1] for item in result]
         gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
         f = np.fft.fft2(gray)
         fshift = np.fft.fftshift(f)
@@ -718,7 +741,7 @@ def analyze_media(image=None, video=None, methods=None, progress=gr.Progress()):
                 'status': 'error',
                 'indicators': [str(e)]
             })
-            print(error_trace)  # Log to Hugging Face console
+            print(error_trace)  # Log to console
 
     # Calculate Final Verdict
     step_count += 1
@@ -1212,6 +1235,10 @@ with gr.Blocks(css=custom_css, title="DeepGuard - AI Media Forensics") as demo:
         outputs=[image_input, video_input, method_check, score_output, heatmap_output, steps_output, json_output]
     )
 
+# ============================================================
+# Launch with proper port binding
+# ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
+    print(f"🚀 Starting DeepGuard on port {port}...")
     demo.launch(server_name="0.0.0.0", server_port=port)
