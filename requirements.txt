@@ -1,6 +1,6 @@
 gradio
-torch --index-url https://download.pytorch.org/whl/cpu
-torchvision --index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
 transformers
 opencv-python-headless
 pillow
@@ -12,6 +12,3 @@ timm
 einops
 ftfy
 pandas
-mediapipe
-scikit-image
-scikit-learn
