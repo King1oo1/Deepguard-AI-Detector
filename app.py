@@ -1,6 +1,7 @@
 # ============================================================
-# DEEPGUARD – FINAL VERSION 
+# DEEPGUARD – FINAL VERSION (
 # TTA + Adversarial + Input Protection + Explain Toggle
+# Auto‑clean temp folder on new upload
 # ============================================================
 
 import torch
@@ -67,6 +68,18 @@ init_db()
 def get_image_hash(image):
     img_bytes = np.array(image).tobytes()
     return hashlib.sha256(img_bytes).hexdigest()
+
+def clear_temp_directory():
+    """Delete all files in the temporary image directory."""
+    if os.path.exists(TEMP_IMAGE_DIR):
+        for filename in os.listdir(TEMP_IMAGE_DIR):
+            file_path = os.path.join(TEMP_IMAGE_DIR, filename)
+            try:
+                if os.path.isfile(file_path):
+                    os.unlink(file_path)
+            except Exception as e:
+                print(f"Error deleting {file_path}: {e}")
+    os.makedirs(TEMP_IMAGE_DIR, exist_ok=True)
 
 def save_temp_image(image, image_hash):
     temp_path = os.path.join(TEMP_IMAGE_DIR, f"{image_hash}.jpg")
@@ -281,7 +294,7 @@ def validate_image(image):
     return True, ""
 
 # ============================================================
-# Main Analysis Function (no heatmap output)
+# Main Analysis Function (with temp cleanup)
 # ============================================================
 def analyze_media(image=None, progress=gr.Progress()):
     if image is None:
@@ -302,6 +315,9 @@ def analyze_media(image=None, progress=gr.Progress()):
         """
         return (gr.update(value=error_html), "{}", "", None, 
                 gr.update(visible=False), gr.update(value=""))
+
+    # Clean up old temporary images before saving new one
+    clear_temp_directory()
 
     progress(0, desc="Initializing DeepGuard...")
     progress(0.1, desc="Analyzing...")
@@ -451,10 +467,12 @@ def toggle_explanation(extra_info, shown):
             **Model Verdict:** {verdict}  
             **Fake Probability:** {fake_prob:.1f}%  
             **Confidence:** {confidence:.1f}%
+
             **Why?**
             - The primary model uses a fine‑tuned Vision Transformer with Test‑Time Augmentation (TTA). It analyses the image as is and with slight blur, then averages the results.
             - TTA stability score (std): {tta_std:.1f}% {'(high – prediction is unstable)' if tta_std > 10 else '(low – prediction is stable)'}
             - Adversarial check: adding random noise changed the score by {adv_diff:.1f}% {'– this is suspicious (could indicate manipulation)' if adv_susp else '– this is normal for real images'}
+
             **Final conclusion:** The image is classified as **{verdict}** because the model’s features strongly indicate {('AI generation' if verdict == 'FAKE' else 'authentic content')}.
             """
         return explanation, True
@@ -560,6 +578,8 @@ with gr.Blocks(css=custom_css, title="DeepGuard - AI Media Forensics") as demo:
     submit_review_btn.click(fn=on_submit_review, inputs=[analysis_state, review_input], outputs=[])
 
     def clear_all():
+        # Also clean temp directory when resetting
+        clear_temp_directory()
         return (None, "", None, gr.update(visible=False), "", "", False)
 
     clear_btn.click(
