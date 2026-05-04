@@ -1,7 +1,7 @@
 # ============================================================
-# DEEPGUARD – FINAL VERSION (
+# DEEPGUARD – MODERN UI (RESPONSIVE + COMPACT NEON BUTTONS)
 # TTA + Adversarial + Input Protection + Explain Toggle
-# Auto‑clean temp folder on new upload
+# Auto‑clean temp + Feedback + Reviews + Hugging Face Upload
 # ============================================================
 
 import torch
@@ -70,7 +70,6 @@ def get_image_hash(image):
     return hashlib.sha256(img_bytes).hexdigest()
 
 def clear_temp_directory():
-    """Delete all files in the temporary image directory."""
     if os.path.exists(TEMP_IMAGE_DIR):
         for filename in os.listdir(TEMP_IMAGE_DIR):
             file_path = os.path.join(TEMP_IMAGE_DIR, filename)
@@ -83,8 +82,7 @@ def clear_temp_directory():
 
 def save_temp_image(image, image_hash):
     temp_path = os.path.join(TEMP_IMAGE_DIR, f"{image_hash}.jpg")
-    if not os.path.exists(temp_path):
-        image.save(temp_path)
+    image.save(temp_path)
     return temp_path
 
 def save_analysis_to_db(image_hash, score, confidence, verdict):
@@ -260,7 +258,6 @@ print("✅ Face detector ready")
 # Input Validation Functions
 # ============================================================
 def is_qr_code(image):
-    """Detect QR code using OpenCV."""
     img_np = np.array(image.convert('RGB'))
     detector = cv2.QRCodeDetector()
     retval, points, straight_qrcode = detector.detectAndDecode(img_np)
@@ -294,31 +291,26 @@ def validate_image(image):
     return True, ""
 
 # ============================================================
-# Main Analysis Function (with temp cleanup)
+# Main Analysis Function (Modern HTML output)
 # ============================================================
 def analyze_media(image=None, progress=gr.Progress()):
     if image is None:
-        return (gr.update(value="⚠️ Please upload an image."), 
-                "{}", "", None, 
-                gr.update(visible=False),   # explain button
-                gr.update(value=""))        # explanation text
+        return (gr.update(value="⚠️ Please upload an image."),
+                "{}", "", None,
+                gr.update(visible=False), gr.update(value=""))
 
     is_valid, error_msg = validate_image(image)
     if not is_valid:
         error_html = f"""
-        <div style="font-family: 'Inter', sans-serif; color: #e5e7eb; text-align: center; padding: 2rem;">
-            <div style="background: #dc262620; border-radius: 24px; padding: 1.5rem;">
-                <h2 style="color: #dc2626;">Invalid Input</h2>
-                <p>{error_msg}</p>
-            </div>
+        <div class="verdict-glass" style="border-color: #dc2626;">
+            <div class="verdict-badge" style="color:#dc2626;">INVALID</div>
+            <p>{error_msg}</p>
         </div>
         """
-        return (gr.update(value=error_html), "{}", "", None, 
+        return (gr.update(value=error_html), "{}", "", None,
                 gr.update(visible=False), gr.update(value=""))
 
-    # Clean up old temporary images before saving new one
     clear_temp_directory()
-
     progress(0, desc="Initializing DeepGuard...")
     progress(0.1, desc="Analyzing...")
 
@@ -327,59 +319,39 @@ def analyze_media(image=None, progress=gr.Progress()):
 
     final_score = calibrate_score(res['score'])
     if final_score > 70:
-        verdict, color, risk = "FAKE", "#dc2626", "HIGH"
+        verdict, color, risk = "FAKE", "#ef4444", "HIGH"
     elif final_score > 45:
-        verdict, color, risk = "FAKE", "#ea580c", "MEDIUM"
+        verdict, color, risk = "FAKE", "#f97316", "MEDIUM"
     elif final_score > 25:
-        verdict, color, risk = "REAL", "#ca8a04", "LOW"
+        verdict, color, risk = "REAL", "#f59e0b", "LOW"
     else:
-        verdict, color, risk = "REAL", "#16a34a", "LOW"
+        verdict, color, risk = "REAL", "#10b981", "LOW"
 
-    # Build HTML display (simplified)
+    badge_class = "fake" if verdict == "FAKE" else "real"
+
     score_display = f"""
-    <div style="font-family: 'Inter', sans-serif; color: #e5e7eb; text-align: center;">
-        <div style="background: {color}20; border-radius: 24px; padding: 1.5rem; margin-bottom: 1.5rem;">
-            <div style="font-size: 3rem; font-weight: 800; color: {color};">{verdict}</div>
-            <div style="font-size: 1rem;">Fake Probability: {final_score:.1f}%</div>
-            <div style="font-size: 0.9rem; color: #9ca3af;">Confidence: {res['confidence']:.1f}%</div>
+    <div class="verdict-glass">
+        <div class="verdict-badge {badge_class}">{verdict}</div>
+        <div>Fake Probability: {final_score:.1f}%</div>
+        <div style="color:#9ca3af; font-size:0.9rem;">Confidence: {res['confidence']:.1f}%</div>
+        <div class="gauge-container"><div class="gauge-fill" style="width: {final_score}%;"></div></div>
+        <div class="stat-grid">
+            <div class="stat-card"><div class="stat-label">Confidence</div><div class="stat-value">{res['confidence']:.0f}%</div></div>
+            <div class="stat-card"><div class="stat-label">Methods</div><div class="stat-value">2</div></div>
+            <div class="stat-card"><div class="stat-label">Analyzed</div><div class="stat-value">{datetime.now().strftime('%H:%M:%S')}</div></div>
         </div>
-        <div style="margin-bottom: 1.5rem;">
-            <div style="background:#374151; height:12px; border-radius:20px; overflow:hidden;">
-                <div style="background:linear-gradient(90deg, #16a34a 0%, #ca8a04 50%, #dc2626 100%); width:{final_score}%; height:100%;"></div>
-            </div>
+        <h3>🔍 Method Details</h3>
+        <div class="method-card" style="border-left-color: #b91c1c;">
+            <div>🔴 Primary Model – {res['score']:.0f}% fake</div>
+            <div style="font-size:0.8rem;">Confidence: {res['confidence']:.0f}% · {res['details']}</div>
         </div>
-        <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:1rem; margin-bottom:1.5rem;">
-            <div style="background:#1f2937; padding:0.75rem; border-radius:12px;">
-                <div style="font-size:0.75rem; color:#9ca3af;">Confidence</div>
-                <div style="font-size:1.5rem; font-weight:700;">{res['confidence']:.1f}%</div>
-            </div>
-            <div style="background:#1f2937; padding:0.75rem; border-radius:12px;">
-                <div style="font-size:0.75rem; color:#9ca3af;">Methods</div>
-                <div style="font-size:1.5rem; font-weight:700;">2</div>
-            </div>
-            <div style="background:#1f2937; padding:0.75rem; border-radius:12px;">
-                <div style="font-size:0.75rem; color:#9ca3af;">Analyzed</div>
-                <div style="font-size:0.9rem; font-weight:500;">{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
-            </div>
-        </div>
-        <h3 style="font-size:1.2rem; font-weight:600; margin-bottom:1rem;">🔍 Method Details</h3>
-        <div style="background:#2d1a1a; border-left:6px solid #b91c1c; padding:1rem; border-radius:8px;">
-            <div style="display:flex; justify-content:space-between;">
-                <span style="font-weight:600; color:#fecaca;">🔴 Primary Model (Stable TTA)</span>
-                <span style="background:#1f2937; padding:0.25rem 0.75rem; border-radius:20px;">{res['score']:.1f}% fake</span>
-            </div>
-            <div style="font-size:0.85rem; color:#9ca3af;">Confidence: {res['confidence']:.1f}% · {res['details']}</div>
-        </div>
-        <div style="background:#1a2e1a; border-left:6px solid #16a34a; padding:1rem; border-radius:8px; margin-top:0.75rem;">
-            <div style="display:flex; justify-content:space-between;">
-                <span style="font-weight:600; color:#bbf7d0;">✅ Adversarial Check</span>
-                <span style="background:#1f2937; padding:0.25rem 0.75rem; border-radius:20px;">{adv['details']}</span>
-            </div>
+        <div class="method-card" style="border-left-color: #16a34a;">
+            <div>✅ Adversarial Check</div>
+            <div style="font-size:0.8rem;">{adv['details']}</div>
         </div>
     </div>
     """
 
-    # Save image and DB entry
     image_hash = get_image_hash(image)
     save_temp_image(image, image_hash)
     save_analysis_to_db(image_hash, final_score, res['confidence'], verdict)
@@ -406,7 +378,7 @@ def analyze_media(image=None, progress=gr.Progress()):
 # ============================================================
 def on_thumbs_up(extra_info):
     if extra_info is None:
-        gr.Info("No analysis data.")
+        gr.Info("No analysis data. Please run analysis first.", duration=3)
         return
     image_hash = extra_info['image_hash']
     target_verdict = extra_info['verdict']
@@ -417,7 +389,7 @@ def on_thumbs_up(extra_info):
 
 def on_thumbs_down(extra_info):
     if extra_info is None:
-        gr.Info("No analysis data.")
+        gr.Info("No analysis data. Please run analysis first.", duration=3)
         return
     image_hash = extra_info['image_hash']
     model_verdict = extra_info['verdict']
@@ -429,10 +401,10 @@ def on_thumbs_down(extra_info):
 
 def on_submit_review(extra_info, review_text):
     if extra_info is None:
-        gr.Info("No analysis data.")
+        gr.Info("No analysis data. Please run analysis first.", duration=3)
         return
     if not review_text.strip():
-        gr.Info("Please enter a review.")
+        gr.Info("Please enter a review.", duration=3)
         return
     image_hash = extra_info['image_hash']
     submit_review_to_db(image_hash, review_text)
@@ -478,47 +450,407 @@ def toggle_explanation(extra_info, shown):
         return explanation, True
 
 # ============================================================
-# Gradio Interface
+# Modern UI with Responsive Glassmorphism + Compact Neon Buttons
 # ============================================================
 custom_css = """
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;400;500;600;700;800&display=swap');
+@import url('https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css');
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
 .gradio-container {
+    background: radial-gradient(circle at 10% 20%, #0a0c10, #030507) !important;
     font-family: 'Inter', sans-serif !important;
-    max-width: 1400px !important;
-    margin: 0 auto !important;
-    background: #0f172a !important;
     padding: 2rem !important;
+    min-height: 100vh;
 }
-.main-header {
-    background: linear-gradient(145deg, #0b1120 0%, #1a2639 100%);
-    color: white;
+
+.glass-header {
+    background: rgba(20, 25, 35, 0.4);
+    backdrop-filter: blur(12px);
+    border-radius: 2rem;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-bottom: 4px solid #8b5cf6;   /* bottom accent line */
     padding: 2rem;
-    border-radius: 32px;
-    margin-bottom: 2rem;
     text-align: center;
-    border: 1px solid #334155;
+    margin-bottom: 2rem;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+    transition: transform 0.2s;
 }
-.main-header h1 { margin: 0; font-size: 2.5rem; font-weight: 800;
-    background: linear-gradient(135deg, #a5f3fc, #c084fc);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-.input-panel { background: #1e293b; border-radius: 28px; padding: 1.5rem; border: 1px solid #334155; height: fit-content; }
-.results-panel { background: #1e293b; border-radius: 28px; padding: 1.5rem; border: 1px solid #334155; min-height: 600px; }
-.primary-btn { background: linear-gradient(145deg, #1e3a8a, #2563eb) !important; border: none; border-radius: 60px; font-weight: 600; padding: 0.8rem; width: 100%; margin-top: 1rem; color: white !important; }
-.secondary-btn { background: #334155 !important; border: 1px solid #475569; border-radius: 60px; color: #e2e8f0; font-weight: 500; padding: 0.7rem; width: 100%; margin-top: 0.75rem; }
-.json-viewer { background: #0b1120 !important; color: #e2e8f0 !important; border-radius: 16px; font-family: monospace; }
-.footer { margin-top: 2rem; padding: 1.5rem; background: #1e293b; border-radius: 28px; text-align: center; color: #9ca3af; display: flex; justify-content: center; gap: 2rem; flex-wrap: wrap; }
+
+.glass-header:hover {
+    transform: translateY(-4px);
+}
+
+.glass-header h1 {
+    font-size: 3.5rem;
+    font-weight: 800;
+    background: linear-gradient(135deg, #a5f3fc, #c084fc, #f472b6);
+    background-size: 200% auto;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: shimmer 3s linear infinite;
+    margin-bottom: 0.5rem;
+}
+
+@keyframes shimmer {
+    0% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+}
+
+.glass-header p {
+    color: #9ca3af;
+    font-size: 1.2rem;
+    letter-spacing: -0.01em;
+}
+
+.glass-card {
+    background: rgba(30, 35, 48, 0.5);
+    backdrop-filter: blur(16px);
+    border-radius: 2rem;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 1.8rem;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.glass-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 20px 35px -10px rgba(0, 0, 0, 0.5);
+}
+
+.upload-area {
+    border: 2px dashed rgba(168, 85, 247, 0.5);
+    border-radius: 1.5rem;
+    background: rgba(0, 0, 0, 0.2);
+    transition: all 0.3s;
+}
+
+.upload-area:hover {
+    border-color: #c084fc;
+    background: rgba(168, 85, 247, 0.05);
+}
+
+/* Compact neon button – slightly smaller */
+.neon-btn {
+    background: linear-gradient(95deg, #3b82f6, #8b5cf6);
+    border: none;
+    border-radius: 3rem;
+    font-weight: 600;
+    padding: 0.6rem 1.5rem;
+    width: 100%;
+    color: white;
+    font-size: 0.95rem;
+    transition: all 0.3s;
+    box-shadow: 0 0 8px rgba(59,130,246,0.4);
+    text-align: center;
+    cursor: pointer;
+}
+
+.neon-btn:hover {
+    transform: scale(1.02);
+    box-shadow: 0 0 20px rgba(139,92,246,0.6);
+    filter: brightness(1.05);
+}
+
+/* Verdict Glass */
+.verdict-glass {
+    background: rgba(15, 20, 30, 0.6);
+    backdrop-filter: blur(20px);
+    border-radius: 2rem;
+    padding: 1.8rem;
+    border: 1px solid rgba(255,255,255,0.1);
+    text-align: center;
+    margin-bottom: 1.5rem;
+}
+
+.verdict-badge {
+    font-size: 3.5rem;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    margin-bottom: 1rem;
+    text-shadow: 0 0 30px currentColor;
+}
+
+.verdict-badge.real { color: #10b981; }
+.verdict-badge.fake { color: #ef4444; }
+
+.gauge-container {
+    background: #1f2937;
+    border-radius: 2rem;
+    height: 12px;
+    overflow: hidden;
+    margin: 1rem 0;
+}
+
+.gauge-fill {
+    background: linear-gradient(90deg, #10b981, #f59e0b, #ef4444);
+    height: 100%;
+    border-radius: 2rem;
+    transition: width 0.5s cubic-bezier(0.2, 0.9, 0.4, 1.1);
+}
+
+.stat-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1rem;
+    margin: 1.5rem 0;
+}
+
+.stat-card {
+    background: rgba(0,0,0,0.3);
+    border-radius: 1.2rem;
+    padding: 1rem;
+    text-align: center;
+    border: 1px solid rgba(255,255,255,0.05);
+}
+
+.stat-label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    color: #9ca3af;
+    letter-spacing: 0.05em;
+}
+
+.stat-value {
+    font-size: 1.8rem;
+    font-weight: 700;
+    color: #f3f4f6;
+}
+
+.method-card {
+    background: rgba(0,0,0,0.3);
+    border-left: 4px solid;
+    border-radius: 1rem;
+    padding: 1rem;
+    margin-bottom: 0.8rem;
+    transition: all 0.2s;
+}
+
+.method-card:hover {
+    transform: translateX(6px);
+    background: rgba(255,255,255,0.05);
+}
+
+.rating-section {
+    margin-top: 1rem;
+}
+
+.legal-note {
+    font-size: 0.75rem;
+    color: #9ca3af;
+    margin-top: 1rem;
+    text-align: center;
+}
+
+/* Review Section */
+.review-heading {
+    font-size: 1.8rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, #a5f3fc, #c084fc, #f472b6);
+    background-size: 200% auto;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 0.5rem;
+    text-align: center;
+}
+
+.review-sub {
+    text-align: center;
+    color: #9ca3af;
+    margin-bottom: 1.5rem;
+    font-size: 0.9rem;
+}
+
+.glass-textarea {
+    background: rgba(0, 0, 0, 0.4) !important;
+    border: 1.5px solid rgba(139, 92, 246, 0.6) !important;
+    border-radius: 1.2rem !important;
+    padding: 1rem !important;
+    color: #e2e8f0 !important;
+    font-size: 1rem !important;
+    font-family: 'Inter', monospace !important;
+    transition: all 0.2s ease !important;
+}
+
+.glass-textarea:focus {
+    border-color: #c084fc !important;
+    box-shadow: 0 0 12px rgba(139, 92, 246, 0.4) !important;
+    outline: none !important;
+}
+
+.footer {
+    margin-top: 2rem;
+    padding: 1.5rem;
+    background: #1e293b;
+    border-radius: 28px;
+    text-align: center;
+    color: #9ca3af;
+    display: flex;
+    justify-content: center;
+    gap: 2rem;
+    flex-wrap: wrap;
+}
+
+.json-viewer {
+    background: #0b1120 !important;
+    color: #e2e8f0 !important;
+    border-radius: 16px;
+    font-family: monospace;
+}
+
+/* ========== RESPONSIVE DESIGN ========== */
+/* Tablet view (max-width: 1024px) */
+@media (max-width: 1024px) {
+    .gradio-container {
+        padding: 1.5rem !important;
+    }
+    .glass-header h1 {
+        font-size: 2.5rem;
+    }
+    .glass-header p {
+        font-size: 1rem;
+    }
+    .glass-card {
+        padding: 1.2rem;
+    }
+    .verdict-badge {
+        font-size: 2.5rem;
+    }
+    .stat-value {
+        font-size: 1.4rem;
+    }
+    .stat-grid {
+        gap: 0.8rem;
+    }
+    .method-card {
+        padding: 0.8rem;
+    }
+    .neon-btn {
+        padding: 0.5rem 1rem;
+        font-size: 0.85rem;
+    }
+}
+
+/* Mobile view (max-width: 768px) */
+@media (max-width: 768px) {
+    .gradio-container {
+        padding: 1rem !important;
+    }
+    .glass-header {
+        padding: 1rem;
+        border-radius: 1.5rem;
+        margin-bottom: 1rem;
+    }
+    .glass-header h1 {
+        font-size: 1.8rem;
+    }
+    .glass-header p {
+        font-size: 0.85rem;
+    }
+    .glass-card {
+        padding: 1rem;
+        border-radius: 1.5rem;
+        margin-bottom: 1rem;
+    }
+    /* Stack columns vertically on mobile */
+    .gradio-container .gr-row {
+        flex-direction: column !important;
+    }
+    .gr-row > .gr-column {
+        width: 100% !important;
+        margin-bottom: 1rem;
+    }
+    .upload-area {
+        height: 220px !important;
+    }
+    .verdict-glass {
+        padding: 1rem;
+        margin-bottom: 1rem;
+    }
+    .verdict-badge {
+        font-size: 2rem;
+    }
+    .gauge-container {
+        height: 8px;
+    }
+    .stat-grid {
+        gap: 0.5rem;
+        margin: 1rem 0;
+    }
+    .stat-card {
+        padding: 0.6rem;
+    }
+    .stat-value {
+        font-size: 1.2rem;
+    }
+    .stat-label {
+        font-size: 0.65rem;
+    }
+    .method-card {
+        padding: 0.7rem;
+        margin-bottom: 0.6rem;
+    }
+    .method-card div {
+        font-size: 0.85rem;
+    }
+    .neon-btn {
+        padding: 0.5rem 0.8rem;
+        font-size: 0.8rem;
+        border-radius: 2rem;
+    }
+    .rating-section {
+        margin-top: 0.5rem;
+    }
+    .legal-note {
+        font-size: 0.7rem;
+        margin-top: 0.8rem;
+    }
+    .review-heading {
+        font-size: 1.4rem;
+    }
+    .review-sub {
+        font-size: 0.8rem;
+        margin-bottom: 1rem;
+    }
+    .glass-textarea {
+        padding: 0.8rem !important;
+        font-size: 0.9rem !important;
+    }
+    .footer {
+        padding: 1rem;
+        gap: 1rem;
+        font-size: 0.7rem;
+    }
+    .json-viewer {
+        font-size: 0.8rem !important;
+    }
+}
 """
 
 with gr.Blocks(css=custom_css, title="DeepGuard - AI Media Forensics") as demo:
-    gr.HTML('<div class="main-header"><h1>🛡️ DeepGuard</h1><p>Advanced AI-Generated Media Detection</p></div>')
+    gr.HTML("""
+    <div class="glass-header">
+        <h1>🛡️ DeepGuard</h1>
+        <p>Advanced AI-Generated Media Detection – Next‑Gen Interface</p>
+    </div>
+    """)
 
     with gr.Row(equal_height=True):
-        with gr.Column(scale=4, elem_classes="input-panel"):
-            gr.Markdown("### 📤 Upload Image")
-            image_input = gr.Image(type="pil", height=300, elem_classes="image-preview", show_label=False)
-            analyze_btn = gr.Button("🔍 Start Forensic Analysis", variant="primary", elem_classes="primary-btn")
-            clear_btn = gr.Button("🔄 Clear & Reset", elem_classes="secondary-btn")
-        with gr.Column(scale=6, elem_classes="results-panel"):
+        with gr.Column(scale=4, elem_classes="glass-card"):
+            gr.Markdown("### 📸 Upload Image")
+            image_input = gr.Image(type="pil", height=320, elem_classes="upload-area", show_label=False)
+            with gr.Row():
+                analyze_btn = gr.Button("🔍 Analyze", elem_classes="neon-btn")
+                clear_btn = gr.Button("⟳ Reset", elem_classes="neon-btn")
+
+        with gr.Column(scale=6, elem_classes="glass-card"):
             gr.Markdown("### 📊 Forensic Report")
             with gr.Tabs():
                 with gr.TabItem("🎯 Verdict"):
@@ -529,31 +861,44 @@ with gr.Blocks(css=custom_css, title="DeepGuard - AI Media Forensics") as demo:
     # Explain section
     with gr.Row():
         with gr.Column():
-            explain_btn = gr.Button("❓ Explain Prediction", variant="secondary", scale=1)
+            explain_btn = gr.Button("❓ Explain Prediction", elem_classes="neon-btn", visible=False)   
             explanation_output = gr.Markdown(label="Explanation", visible=True, value="")
             gr.Markdown("---")
 
-    # Rating
+    # Rating section
     with gr.Row():
-        with gr.Column():
+        with gr.Column(elem_classes="glass-card rating-section"):
             gr.Markdown("### 📝 Rate this prediction")
             with gr.Row():
-                thumbs_up = gr.Button("👍 Thumbs Up (Correct)", variant="primary", scale=1)
-                thumbs_down = gr.Button("👎 Thumbs Down (Incorrect)", variant="secondary", scale=1)
+                thumbs_up = gr.Button("👍 Thumbs Up (Correct)", elem_classes="neon-btn")
+                thumbs_down = gr.Button("👎 Thumbs Down (Incorrect)", elem_classes="neon-btn")
             gr.HTML("""
-            <div style="margin-top: 0.5rem; font-size: 0.8rem; color: #9ca3af;">
+            <div class="legal-note">
                 <i class="fas fa-info-circle"></i> <strong>Legal notice:</strong> By clicking 👍 or 👎, 
                 you agree that your image will be stored permanently to help improve the deepfake 
                 detection model. Your feedback is anonymized and used solely for research purposes.
             </div>
             """)
 
-    # Review
+    # Review section
     with gr.Row():
-        with gr.Column():
-            gr.Markdown("### ✍️ Leave a Detailed Review")
-            review_input = gr.Textbox(label="Your comments", lines=2, placeholder="What did you think of this app?")
-            submit_review_btn = gr.Button("Submit Review", variant="secondary", size="sm")
+        with gr.Column(elem_classes="glass-card"):
+            gr.HTML("""
+            <div class="review-heading">
+                <i class="fas fa-pen-fancy"></i> Leave a Detailed Review
+            </div>
+            <div class="review-sub">
+                Help us improve – your feedback matters
+            </div>
+            """)
+            review_input = gr.Textbox(
+                label="Your comments",
+                lines=3,
+                placeholder="What did you think of this app? Be honest – we love constructive feedback!",
+                elem_classes="glass-textarea"
+            )
+            submit_review_btn = gr.Button("Submit Review", elem_classes="neon-btn")
+            review_output = gr.HTML(label="")
 
     analysis_state = gr.State(None)
     explanation_shown = gr.State(False)
@@ -575,10 +920,9 @@ with gr.Blocks(css=custom_css, title="DeepGuard - AI Media Forensics") as demo:
 
     thumbs_up.click(fn=on_thumbs_up, inputs=[analysis_state], outputs=[])
     thumbs_down.click(fn=on_thumbs_down, inputs=[analysis_state], outputs=[])
-    submit_review_btn.click(fn=on_submit_review, inputs=[analysis_state, review_input], outputs=[])
+    submit_review_btn.click(fn=on_submit_review, inputs=[analysis_state, review_input], outputs=[review_output])
 
     def clear_all():
-        # Also clean temp directory when resetting
         clear_temp_directory()
         return (None, "", None, gr.update(visible=False), "", "", False)
 
@@ -587,6 +931,15 @@ with gr.Blocks(css=custom_css, title="DeepGuard - AI Media Forensics") as demo:
         inputs=[],
         outputs=[image_input, score_output, analysis_state, explain_btn, explanation_output, json_output, explanation_shown]
     )
+
+    gr.HTML("""
+    <div class="footer">
+        <span><i class="fas fa-copyright"></i> 2026 DeepGuard</span>
+        <span><i class="fas fa-code-branch"></i> v5.0</span>
+        <span><i class="fas fa-flask"></i> Research Use Only</span>
+        <span><i class="fas fa-database"></i> Feedback stored & uploaded to Hugging Face Hub</span>
+    </div>
+    """)
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860, ssr_mode=False)
